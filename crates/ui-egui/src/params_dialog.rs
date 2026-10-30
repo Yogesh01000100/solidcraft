@@ -47,6 +47,9 @@ pub struct ParamsDialog {
     pub error: Option<String>,
     /// The expression edit to preview: (name, expression).
     pub preview: Option<(String, String)>,
+    /// The text of the expression box that has focus: the Expression column opens to its
+    /// width while it is edited (#9358).
+    wide_expression: Option<String>,
     /// The rows as the engine listed them at one revision of the design (#2723): listing
     /// evaluates every parameter, so it happens when the design changes, not every frame.
     listed: Option<(u64, Arc<Vec<Row>>)>,
@@ -412,7 +415,7 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
         Column::new("Unit", 0.65).min_content_width(
             ui_kit::ContentWidth::dropdown(ui, &units).max(crate::theme::Tokens::get().space_24 * 3.0 + crate::theme::Tokens::get().space_6),
         ),
-        Column::new("Expression", 1.5).flex(),
+        Column::new("Expression", 1.5).flex().min_content_width(expression_floor(ui, d)),
         Column::new("Value", 1.1).flex(),
         Column::new("Comment", 1.0).flex(),
         Column::new("Actions", 0.0).icon_only().min_content_width(ui_kit::table_row_height()),
@@ -504,6 +507,7 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
                     if response.changed() || completed {
                         d.editing.insert(r.name.clone(), expression.clone());
                     }
+                    widen_while_focused(ui, d, &response, &expression);
                     if response.has_focus() && matches!(live, Some(Ok(_))) {
                         d.preview = Some((r.name.clone(), expression.clone()));
                     }
@@ -565,6 +569,32 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
     });
 }
 
+/// The Expression column's floor: the width of the expression being edited, so a long formula
+/// shows whole while it is typed (#9358). It takes at most 60% of the table, and every section
+/// reads the same floor, so their columns stay lined up. Resizing columns by hand is #5097.
+fn expression_floor(ui: &egui::Ui, d: &ParamsDialog) -> f32 {
+    let Some(text) = &d.wide_expression else { return 0.0 };
+    let t = crate::theme::Tokens::get();
+    let text_width = ui.painter().layout_no_wrap(text.clone(), egui::FontId::monospace(t.font_label), t.form_ink).size().x;
+    (text_width + t.form_inset * 2.0 + t.space_8).min(ui.available_width() * 0.6)
+}
+
+/// Record the focused expression box's text for [`expression_floor`], and let it go when the
+/// box loses focus. The column follows on the next frame, so a change asks for one.
+fn widen_while_focused(ui: &egui::Ui, d: &mut ParamsDialog, response: &egui::Response, text: &str) {
+    let wide = if response.has_focus() {
+        Some(text)
+    } else if response.lost_focus() || (d.wide_expression.is_some() && ui.memory(|m| m.focused().is_none())) {
+        None
+    } else {
+        return;
+    };
+    if d.wide_expression.as_deref() != wide {
+        d.wide_expression = wide.map(str::to_owned);
+        ui.ctx().request_repaint();
+    }
+}
+
 fn unit_label(u: &str) -> &str {
     if u.is_empty() { crate::i18n::tr_label("none") } else { u }
 }
@@ -623,6 +653,8 @@ fn add_row(app: &mut SolveApp, ui: &mut egui::Ui, table: &mut ui_kit::Table<'_>,
             select_all_on_tab(ui, &response, &d.new_expr);
             crate::scenario::publish_handle("param:new:expression", response.rect.center());
             let completed = complete(ui, &response, &mut d.new_expr);
+            let text = d.new_expr.clone();
+            widen_while_focused(ui, d, &response, &text);
             submit = !completed && enter_for(ui, focused_id.is_some());
             left |= !completed && response.lost_focus();
         });
@@ -1148,6 +1180,41 @@ mod tests {
         h.step(&json!({"click": {"handle": "dialog:Filter"}})).unwrap();
         assert_eq!(h.app.session.doc.param("width").unwrap().unit, "cm");
         assert!(h.app.params.as_ref().unwrap().error.is_none());
+    }
+
+    /// A long expression opens the Expression column while it is edited, in every section, and
+    /// the column goes back when the box loses focus (#9358).
+    #[test]
+    fn a_long_expression_widens_its_column_while_it_is_edited() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.step(&json!({"start": "parameters.change"})).unwrap();
+        let long = "slots * 2 + slots * 3 + slots * 4 + slots * 5 + slots * 6 + slots * 7 + slots * 8";
+        for (name, expression) in [("slots", "10 mm"), ("total", long)] {
+            h.step(&json!({"click": {"handle": "dialog:table:user:add"}})).unwrap();
+            h.step(&json!({"text": name})).unwrap();
+            h.step(&json!({"click": {"handle": "param:new:expression"}})).unwrap();
+            h.step(&json!({"text": expression})).unwrap();
+            h.step(&json!({"key": "Enter"})).unwrap();
+        }
+        assert_eq!(h.app.session.doc.param("total").unwrap().expr, long);
+        let column = || crate::scenario::rect_of("dialog:column:user:Expression").unwrap();
+        let name = || crate::scenario::rect_of("dialog:column:user:Name").unwrap();
+        let (closed, named) = (column(), name());
+        h.step(&json!({"click": {"handle": "param:total"}})).unwrap();
+        h.frame();
+        let open = column();
+        let t = crate::theme::Tokens::get();
+        let text = h.ctx.fonts_mut(|f| f.layout_no_wrap(long.into(), egui::FontId::monospace(t.font_label), t.form_ink).size().x);
+        assert!(open.width() > closed.width() + 50.0, "the column opens while the long expression is edited: {closed:?} -> {open:?}");
+        let table = crate::scenario::rect_of("dialog:table:user:viewport").unwrap();
+        assert!(open.width() >= text.min(table.width() * 0.55), "it fits the expression, up to its share of the table: {open:?}, {text}");
+        assert!(open.width() <= table.width() * 0.6 + 1.0, "it leaves the other columns room");
+        assert!(name().width() > 0.0 && name().width() <= named.width(), "the other columns narrow but stay");
+        h.step(&json!({"click": {"handle": "dialog:Filter"}})).unwrap();
+        h.frame();
+        assert_eq!(column().width(), closed.width(), "the column goes back when the box loses focus");
+        assert_eq!(h.app.session.doc.param("total").unwrap().expr, long, "focusing the box changes nothing");
     }
 
     /// A design with hundreds of chained parameters.
